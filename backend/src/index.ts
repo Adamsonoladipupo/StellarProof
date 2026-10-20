@@ -7,6 +7,7 @@ import { startVerificationTimeoutJob } from "./jobs/verificationTimeout.job";
 import { startEventIngestionJob } from "./jobs/eventIngestion.job";
 import { startCertificateIndexerJob } from "./jobs/certificateIndexer.job";
 import { startStorageHealthJob } from "./jobs/storageHealth.job";
+import { startKmsRotationJob } from "./jobs/kmsRotation.job";
 import { statusStreamService } from "./services/statusStream.service";
 
 function hasCloudinaryConfig(): boolean {
@@ -29,6 +30,8 @@ async function main(): Promise<void> {
   const stopCertificateIndexer = env.STELLAR_PROVENANCE_CONTRACT_ID
     ? startCertificateIndexerJob()
     : undefined;
+
+  const kmsRotationJob = startKmsRotationJob();
 
   if (hasCloudinaryConfig()) {
     initCloudinary();

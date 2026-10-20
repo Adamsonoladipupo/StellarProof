@@ -230,4 +230,27 @@ export const env = {
 
   /** Base delay (ms) for the exponential backoff between IPFS upload attempts */
   IPFS_UPLOAD_BACKOFF_MS: optionalPositiveIntEnv("IPFS_UPLOAD_BACKOFF_MS", 500),
+
+  /**
+   * Master key that wraps every per-user KMS symmetric key at rest. The
+   * default keeps existing development setups working; set it explicitly in
+   * production.
+   */
+  MASTER_KEY: optionalEnv("MASTER_KEY", "default-master-key-change-in-production"),
+
+  /**
+   * Previous master key, set only while a master-key rotation is in progress.
+   * Keys wrapped under it stay readable until `pnpm kms:rewrap` has re-wrapped
+   * them under MASTER_KEY. Clear it once the sweep reports no failures.
+   */
+  MASTER_KEY_PREVIOUS: optionalEnv("MASTER_KEY_PREVIOUS", ""),
+
+  /** Age in days after which an active KMS key is rotated. 0 disables scheduled rotation. */
+  KMS_ROTATION_PERIOD_DAYS: optionalNonNegativeIntEnv("KMS_ROTATION_PERIOD_DAYS", 0),
+
+  /** Keys processed per batch by the scheduled KMS rotation sweep */
+  KMS_ROTATION_BATCH_SIZE: optionalPositiveIntEnv("KMS_ROTATION_BATCH_SIZE", 25),
+
+  /** Cron expression (UTC) for the scheduled KMS expiry and rotation sweep */
+  KMS_ROTATION_CRON_SCHEDULE: optionalEnv("KMS_ROTATION_CRON_SCHEDULE", "0 * * * *"),
 } as const;

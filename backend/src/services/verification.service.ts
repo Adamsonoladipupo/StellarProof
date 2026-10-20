@@ -493,14 +493,8 @@ export const verificationService = {
   assertJobOwner,
   updateJobStatus,
   receiveOracleAttestation,
-  advanceFromAttestationEvent: async (event: any): Promise<IVerificationJob | null> => {
-    // Simple implementation for compilation
-    return null;
-  },
-  completeFromMintEvent: async (event: any): Promise<IVerificationJob | null> => {
-    // Simple implementation for compilation
-    return null;
-  },
+  advanceFromAttestationEvent,
+  completeFromMintEvent,
   getJobTimeline,
   retryJob,
   verifyManifestIntegrity,

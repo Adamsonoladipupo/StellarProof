@@ -10,9 +10,16 @@ import {
   sorobanEventBus,
   type IngestedSorobanEvent,
   type SorobanEventBus,
+  type SorobanEventSubscriber,
 } from "./sorobanEventBus.service";
+import { processedRequestService, type ProcessedRequestService } from "./processedRequest.service";
 
 const STREAM = "oracle-provenance-events";
+
+/** Cursors are stored per contract so each watched contract resumes independently. */
+function streamFor(contractId: string): string {
+  return `${STREAM}:${contractId}`;
+}
 
 const TOPIC_VERIFICATION_REQUEST = xdr.ScVal.scvSymbol("VerificationRequest").toXDR("base64");
 const TOPIC_ATTESTATION = xdr.ScVal.scvSymbol("Attestation").toXDR("base64");
@@ -27,18 +34,18 @@ const TOPIC_PROVIDER_REMOVED = xdr.ScVal.scvSymbol("ProviderRemoved").toXDR("bas
 let defaultSubscriberRegistered = false;
 
 interface EventCursorStore {
-  get(): Promise<{ cursor: string; latestLedger: number } | null>;
-  save(cursor: string, latestLedger: number): Promise<void>;
+  get(contractId: string): Promise<{ cursor: string; latestLedger: number } | null>;
+  save(contractId: string, cursor: string, latestLedger: number): Promise<void>;
 }
 
 const mongooseCursorStore: EventCursorStore = {
-  async get() {
-    return EventIngestionCursorModel.findOne({ stream: STREAM })
+  async get(contractId) {
+    return EventIngestionCursorModel.findOne({ stream: streamFor(contractId) })
       .lean<{ cursor: string; latestLedger: number }>();
   },
-  async save(cursor, latestLedger) {
+  async save(contractId, cursor, latestLedger) {
     await EventIngestionCursorModel.updateOne(
-      { stream: STREAM },
+      { stream: streamFor(contractId) },
       { $set: { cursor, latestLedger } },
       { upsert: true }
     );
@@ -54,6 +61,25 @@ interface EventMintService {
   mintForJob(jobId: string): Promise<Record<string, unknown>>;
 }
 
+export interface VerificationEventDeps {
+  processed: Pick<ProcessedRequestService, "runOnce">;
+  jobs: EventJobService;
+  minter: EventMintService;
+}
+
+interface EventSource {
+  contractId: string;
+  topics: string[][];
+}
+
+interface SourceBatch {
+  received: number;
+  matched: number;
+  correlated: number;
+  latestLedger: number;
+  cursor: string;
+}
+
 export interface EventIngestionConfig {
   oracleContractId: string;
   provenanceContractId: string;
@@ -67,7 +93,8 @@ export interface EventIngestionResult {
   matched: number;
   correlated: number;
   latestLedger: number;
-  cursor: string;
+  /** Cursor reached for each watched contract in this pass. */
+  cursors: Record<string, string>;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -135,40 +162,65 @@ export class EventIngestionService {
     }
   }
 
+  /**
+   * Polls each watched contract once. Every contract has its own cursor, so a
+   * restart resumes each one from where it stopped. A cursor is saved only after
+   * every event in its batch has been handled. If the worker crashes first, the
+   * batch replays, and the guards in the event subscriber skip work that already
+   * completed.
+   */
   async ingestOnce(): Promise<EventIngestionResult> {
-    const saved = await this.cursors.get();
+    const result: EventIngestionResult = {
+      received: 0,
+      matched: 0,
+      correlated: 0,
+      latestLedger: 0,
+      cursors: {},
+    };
+
+    for (const source of this.eventSources()) {
+      const batch = await this.ingestSource(source);
+      result.received += batch.received;
+      result.matched += batch.matched;
+      result.correlated += batch.correlated;
+      result.latestLedger = Math.max(result.latestLedger, batch.latestLedger);
+      result.cursors[source.contractId] = batch.cursor;
+    }
+
+    return result;
+  }
+
+  private eventSources(): EventSource[] {
+    return [
+      {
+        contractId: this.config.oracleContractId,
+        // Keep the existing attestation compatibility while adding the
+        // VerificationRequest topic required by #684.
+        topics: [[TOPIC_VERIFICATION_REQUEST], [TOPIC_ATTESTATION], [TOPIC_ATTESTED]],
+      },
+      {
+        contractId: this.config.provenanceContractId,
+        topics: [[TOPIC_CERTIFICATE_MINTED]],
+      },
+      {
+        contractId: this.config.registryContractId,
+        // Registry events are published as ("registry", EventName, ...).
+        // Keep the filter exact so every fetched event is one this decoder
+        // understands and can advance past durably.
+        topics: [
+          [TOPIC_REGISTRY, TOPIC_TEE_HASH_ADDED],
+          [TOPIC_REGISTRY, TOPIC_TEE_HASH_REMOVED],
+          [TOPIC_REGISTRY, TOPIC_PROVIDER_ADDED],
+          [TOPIC_REGISTRY, TOPIC_PROVIDER_REMOVED],
+        ],
+      },
+    ];
+  }
+
+  private async ingestSource(source: EventSource): Promise<SourceBatch> {
+    const saved = await this.cursors.get(source.contractId);
     const response = await this.rpcClient.getEvents({
-      filters: [
-        {
-          type: "contract",
-          contractIds: [this.config.oracleContractId],
-          // Keep the existing attestation compatibility while adding the
-          // VerificationRequest topic required by #684.
-          topics: [
-            [TOPIC_VERIFICATION_REQUEST],
-            [TOPIC_ATTESTATION],
-            [TOPIC_ATTESTED],
-          ],
-        },
-        {
-          type: "contract",
-          contractIds: [this.config.provenanceContractId],
-          topics: [[TOPIC_CERTIFICATE_MINTED]],
-        },
-        {
-          type: "contract",
-          contractIds: [this.config.registryContractId],
-          // Registry events are published as ("registry", EventName, ...).
-          // Keep the filter exact so every fetched event is one this decoder
-          // understands and can advance past durably.
-          topics: [
-            [TOPIC_REGISTRY, TOPIC_TEE_HASH_ADDED],
-            [TOPIC_REGISTRY, TOPIC_TEE_HASH_REMOVED],
-            [TOPIC_REGISTRY, TOPIC_PROVIDER_ADDED],
-            [TOPIC_REGISTRY, TOPIC_PROVIDER_REMOVED],
-          ],
-        },
-      ],
+      filters: [{ type: "contract", contractIds: [source.contractId], topics: source.topics }],
       limit: this.config.limit,
       ...(saved?.cursor
         ? { cursor: saved.cursor }
@@ -202,12 +254,14 @@ export class EventIngestionService {
           requestId,
         });
       }
-
-      await this.cursors.save(event.pagingToken, event.ledger);
     }
 
-    if (response.events.length === 0 && response.cursor) {
-      await this.cursors.save(response.cursor, response.latestLedger);
+    // One cursor write per batch, after the whole batch has been handled.
+    const last = response.events[response.events.length - 1];
+    if (last) {
+      await this.cursors.save(source.contractId, last.pagingToken, last.ledger);
+    } else if (response.cursor) {
+      await this.cursors.save(source.contractId, response.cursor, response.latestLedger);
     }
 
     return {
@@ -215,7 +269,7 @@ export class EventIngestionService {
       matched,
       correlated,
       latestLedger: response.latestLedger,
-      cursor: response.cursor,
+      cursor: last?.pagingToken ?? response.cursor,
     };
   }
 
@@ -319,38 +373,62 @@ export class EventIngestionService {
   }
 }
 
-export function createEventIngestionService(): EventIngestionService {
-  const { env } = require("../config/env") as typeof import("../config/env");
-  const { sorobanService } = require("./soroban.service") as typeof import("./soroban.service");
+/**
+ * Builds the bus subscriber that advances verification jobs from on-chain
+ * events. Each delivery runs through `processed.runOnce`, so a request is
+ * handled at most once, even when a batch replays after a crash or two workers
+ * see the same event.
+ */
+export function createVerificationEventSubscriber(deps: VerificationEventDeps): SorobanEventSubscriber {
+  return async (event) => {
+    if (event.kind === "registry" || event.kind === "verificationRequest") {
+      return false;
+    }
 
-  if (!defaultSubscriberRegistered) {
-    defaultSubscriberRegistered = true;
-    sorobanEventBus.subscribe(async (event) => {
-      if (event.kind === "registry" || event.kind === "verificationRequest") {
-        return false;
-      }
+    // Keyed by event kind so an attestation and a mint for one request do not
+    // block each other. Events without a request id fall back to their event id.
+    const dedupKey = `${event.kind}:${event.requestId ?? event.eventId}`;
 
+    const outcome = await deps.processed.runOnce(dedupKey, event.eventId, async () => {
       const job =
         event.kind === "certificateMinted"
-          ? await verificationService.completeFromMintEvent({
+          ? await deps.jobs.completeFromMintEvent({
               manifestHash: event.manifestHash,
               requestId: event.requestId,
               certificateId: event.certificateId,
               transactionHash: event.transactionHash,
             })
-          : await verificationService.advanceFromAttestationEvent({
+          : await deps.jobs.advanceFromAttestationEvent({
               manifestHash: event.manifestHash,
               requestId: event.requestId,
               attestationHash: event.attestationHash,
               transactionHash: event.transactionHash,
             });
 
-      if (!job) return false;
+      if (!job) return { handled: false };
       if (event.kind === "attestation" && job._id) {
-        await mintService.mintForJob(String(job._id));
+        await deps.minter.mintForJob(String(job._id));
       }
-      return true;
+      return { handled: true, jobId: job._id ? String(job._id) : undefined };
     });
+
+    return outcome.outcome === "handled";
+  };
+}
+
+export function createEventIngestionService(): EventIngestionService {
+  const { env } = require("../config/env") as typeof import("../config/env");
+  const { sorobanService } = require("./soroban.service") as typeof import("./soroban.service");
+
+  if (!defaultSubscriberRegistered) {
+    defaultSubscriberRegistered = true;
+    sorobanEventBus.subscribe(
+      createVerificationEventSubscriber({
+        processed: processedRequestService,
+        jobs: verificationService,
+        minter: mintService,
+      })
+    );
   }
 
   return new EventIngestionService(

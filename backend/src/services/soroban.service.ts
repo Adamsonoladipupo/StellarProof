@@ -1,9 +1,11 @@
 ﻿import {
   Account,
+  BASE_FEE,
   FeeBumpTransaction,
   Keypair,
   StrKey,
   Transaction,
+  TransactionBuilder,
   rpc,
 } from "@stellar/stellar-sdk";
 import { StatusCodes } from "http-status-codes";
@@ -37,6 +39,28 @@ export type SimulationResult =
 export type SubmittedTransaction = rpc.Api.SendTransactionResponse & {
   status: "PENDING" | "DUPLICATE";
 };
+
+/**
+ * Typed outcome of a preflight simulation. Fees are decimal strings in stroops
+ * so the result serialises to JSON without loss.
+ */
+export interface ContractCallSimulation {
+  latestLedger: number;
+  /** The contract state must be restored before the call can succeed. */
+  restoreRequired: boolean;
+  /** Resource fee reported by the network for the simulated invocation. */
+  minResourceFee: string;
+  /** Minimum total fee: resource fee plus the base inclusion fee (one operation). */
+  requiredFee: string;
+  /** Fee set on the transaction being checked. */
+  submittedFee: string;
+  feeSufficient: boolean;
+  /** Authorization entries the invocation needs signed before submission. */
+  authEntryCount: number;
+  authorizationRequired: boolean;
+  /** True when the transaction is safe to sign and submit as built. */
+  readyToSubmit: boolean;
+}
 
 export interface SorobanServiceConfig {
   rpcUrl: string;
@@ -380,6 +404,54 @@ export class SorobanService {
 
     throw new TxTimeout(txHash, timeoutMs, attempts, consecutiveRpcErrors > 0);
   }
+  /**
+   * Preflight a contract invocation without submitting it.
+   *
+   * 1. The XDR must decode and contain exactly one `invokeHostFunction` operation.
+   * 2. The transaction is simulated; contract traps and invalid arguments are
+   *    raised as 422 by `simulate`.
+   * 3. Authorization entries and the fee are checked against the simulation, so
+   *    the caller learns what is missing before paying for a real submission.
+   */
+  async simulateContractCall(transaction: SorobanTransaction): Promise<ContractCallSimulation> {
+    let decoded: SorobanTransaction;
+    try {
+      decoded = TransactionBuilder.fromXDR(transaction.toXDR(), this.networkPassphrase);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new AppError(`Malformed transaction XDR: ${reason}`, StatusCodes.BAD_REQUEST, "MALFORMED_TRANSACTION_XDR");
+    }
+
+    const inner = decoded instanceof FeeBumpTransaction ? decoded.innerTransaction : decoded;
+    if (inner.operations.length !== 1 || inner.operations[0].type !== "invokeHostFunction") {
+      throw new AppError(
+        "Contract call simulation requires exactly one invokeHostFunction operation",
+        StatusCodes.BAD_REQUEST,
+        "NOT_A_CONTRACT_CALL"
+      );
+    }
+
+    const simulation = await this.simulate(transaction);
+    const restoreRequired = rpc.Api.isSimulationRestore(simulation);
+    const authEntryCount = simulation.result?.auth?.length ?? 0;
+    const minResourceFee = BigInt(simulation.minResourceFee);
+    const requiredFee = minResourceFee + BigInt(BASE_FEE);
+    const submittedFee = BigInt(decoded.fee);
+    const feeSufficient = submittedFee >= requiredFee;
+
+    return {
+      latestLedger: simulation.latestLedger,
+      restoreRequired,
+      minResourceFee: minResourceFee.toString(),
+      requiredFee: requiredFee.toString(),
+      submittedFee: submittedFee.toString(),
+      feeSufficient,
+      authEntryCount,
+      authorizationRequired: authEntryCount > 0,
+      readyToSubmit: feeSufficient && !restoreRequired,
+    };
+  }
+
   private toAppError(operation: SorobanOperation, error: unknown): AppError {
     if (error instanceof AppError) {
       return error;

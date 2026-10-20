@@ -19,6 +19,8 @@ import Manifest from "../models/Manifest.model";
 import { VerificationJobModel } from "../models/verificationJob.model";
 import { verificationService } from "../services/verification.service";
 import { statusStreamService } from "../services/statusStream.service";
+import { spvSignatureService } from "../services/spvSignature.service";
+import type { VerifySpvSignatureInput } from "../types/spvSignature.types";
 import type {
   CreateVerificationJobDTO,
   UpdateVerificationStatusDTO,
@@ -29,6 +31,25 @@ import type {
 import { VerificationStatus } from "../types/verification.types";
 
 export class VerificationController {
+  /**
+   * POST /api/v1/verification/verify-signature
+   * Re-verifies an SPV signature against the stored SPV record.
+   * Responds 200 with `{ valid }` plus `reason`/`message` on failure.
+   */
+  async verifySpvSignature(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      const input = req.body as VerifySpvSignatureInput;
+      const result = await spvSignatureService.verify(input);
+      res.status(StatusCodes.OK).json({ success: true, data: result });
+    } catch (err) {
+      next(err);
+    }
+  }
+
   /**
    * POST /api/v1/verify/submit
    * Validates ownership and creates a pending Truth Engine verification job.
