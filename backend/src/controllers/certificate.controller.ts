@@ -3,7 +3,9 @@ import type { Request, Response, NextFunction } from "express";
 import { StatusCodes } from "http-status-codes";
 import { AppError } from "../errors/AppError";
 import { certificateService } from "../services/certificate.service";
-import type { ListCertificatesQuery } from "../types/certificate.types";
+import { certificateShareService } from "../services/certificateShare.service";
+import { certificateExportService } from "../services/certificateExport.service";
+import type { CertificateRequester, ListCertificatesQuery } from "../types/certificate.types";
 import logger from "../utils/logger";
 import { toCsvLine } from "../utils/csv";
 
@@ -21,6 +23,28 @@ const CSV_COLUMNS = [
   "verificationJobId",
   "createdAt",
 ] as const;
+
+/** Certificate id from the path, or a 400 when it is blank. */
+function requireCertificateId(req: Request): string {
+  const id = req.params.id?.trim();
+  if (!id) {
+    throw new AppError("Certificate id is required", StatusCodes.BAD_REQUEST, "MISSING_CERTIFICATE_ID");
+  }
+  return id;
+}
+
+/** Authenticated caller as a certificate requester, or a 401. */
+function requireRequester(req: Request): CertificateRequester {
+  if (!req.user) {
+    throw new AppError("Authentication required", StatusCodes.UNAUTHORIZED, "UNAUTHORIZED");
+  }
+  return { id: req.user.id, role: req.user.role };
+}
+
+/** Download file name for a certificate export, restricted to safe characters. */
+function exportFileName(certificateId: string, extension: "json" | "pdf"): string {
+  return `stellarproof-certificate-${certificateId.replace(/[^A-Za-z0-9_-]/g, "_")}.${extension}`;
+}
 
 export class CertificateController {
   async listCertificates(
@@ -208,6 +232,85 @@ export class CertificateController {
         success: true,
         data: certificate,
       });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/certificates/:id/share
+   * Owner or admin issues a signed, expiring share link for the public
+   * certificate page.
+   */
+  async shareCertificate(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const link = await certificateShareService.createShareLink(
+        requireCertificateId(req),
+        requireRequester(req)
+      );
+      res.status(StatusCodes.OK).json({ success: true, data: link });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/certificates/share/:token
+   * Public: resolves a share token to certificate metadata without owner PII.
+   */
+  async getSharedCertificate(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const token = req.params.token?.trim();
+      if (!token) {
+        throw new AppError("Share token is required", StatusCodes.BAD_REQUEST, "MISSING_SHARE_TOKEN");
+      }
+
+      const certificate = await certificateShareService.resolveShareToken(token);
+      res.status(StatusCodes.OK).json({ success: true, data: certificate });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/certificates/:id/export.json
+   * Owner or admin downloads the verifiable JSON export of a certificate.
+   */
+  async exportCertificateJson(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const data = await certificateExportService.buildJsonExport(
+        requireCertificateId(req),
+        requireRequester(req)
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${exportFileName(data.certificate.certificateId, "json")}"`
+      );
+      res.status(StatusCodes.OK).json(data);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/certificates/:id/export.pdf
+   * Owner or admin downloads a PDF rendition with a verification QR code.
+   */
+  async exportCertificatePdf(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const data = await certificateExportService.buildJsonExport(
+        requireCertificateId(req),
+        requireRequester(req)
+      );
+      const pdf = await certificateExportService.renderPdf(data);
+      res.status(StatusCodes.OK);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${exportFileName(data.certificate.certificateId, "pdf")}"`
+      );
+      res.setHeader("Content-Length", pdf.byteLength);
+      res.end(pdf);
     } catch (err) {
       next(err);
     }

@@ -65,6 +65,68 @@ export interface CertificateRevocationStatus {
   revokedAt: string | null;
 }
 
+/** Response of GET /api/v1/certificates/:id/share. */
+export interface CertificateShareLink {
+  /** Public certificate page URL carrying the signed share token. */
+  certLink: string;
+  /** The signed share token (JWT) embedded in `certLink`. */
+  token: string;
+  /** ISO-8601 expiry of the token. */
+  expiresAt: string;
+}
+
+/**
+ * Certificate metadata a share token unlocks for the public page. Holds only
+ * on-chain proof data: no owner account, email, public key or file name.
+ */
+export interface SharedCertificateMetadata {
+  certificateId: string;
+  network: 'testnet' | 'mainnet';
+  contractAddress: string;
+  transactionHash: string;
+  ledgerSequence: number;
+  mintedAt: string;
+  contentHash: string | null;
+  manifestHash: string | null;
+  explorerUrl: string;
+  revocation: CertificateRevocationStatus;
+}
+
+/** Verifiable JSON export of a certificate (GET /api/v1/certificates/:id/export.json). */
+export interface CertificateExport {
+  /** Export format version; bumped on breaking changes to this shape. */
+  version: 1;
+  exportedAt: string;
+  certificate: {
+    certificateId: string;
+    network: 'testnet' | 'mainnet';
+    contractAddress: string;
+    transactionHash: string;
+    ledgerSequence: number;
+    mintedAt: string;
+    revocation: CertificateRevocationStatus;
+  };
+  proof: {
+    /** Media CID, when the asset is stored on IPFS. */
+    mediaCid: string | null;
+    manifestCid: string | null;
+    contentHash: string | null;
+    manifestHash: string | null;
+    /** TEE attestation hash recorded for the verification job. */
+    attestationHash: string | null;
+    /** Oracle signature over the attestation. */
+    signature: string | null;
+    codeMeasurementHash: string | null;
+    attestationTransactionHash: string | null;
+    /** Stellar public key the certificate was minted to. */
+    creator: string | null;
+  };
+  links: {
+    explorerUrl: string;
+    verificationUrl: string;
+  };
+}
+
 /** Full verification payload returned by GET /api/v1/certificates/verify/:id. */
 export interface CertificateVerificationDetails {
   certificateId: string;

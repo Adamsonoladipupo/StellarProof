@@ -16,6 +16,9 @@
  *     Creator dashboard metrics: total minted, unique verified assets and a
  *     trailing 12-month mint series.
  *
+ *   GET /api/v1/certificates/share/:token
+ *     Resolves a signed share token to certificate metadata without owner PII.
+ *
  *   POST /api/v1/certificates/:id/revoke (authenticated; see
  *     certificate.revocation.routes.ts)
  *     Owner or admin records an off-chain revocation.
@@ -186,6 +189,17 @@ router.get(
   "/",
   validateListCertificatesQuery,
   certificateController.listCertificates.bind(certificateController)
+);
+
+/**
+ * GET /api/v1/certificates/share/:token
+ *
+ * Public endpoint behind share links. Returns 401 for an invalid token, 410
+ * once it has expired and 404 if the certificate no longer exists.
+ */
+router.get(
+  "/share/:token",
+  certificateController.getSharedCertificate.bind(certificateController)
 );
 
 /**
