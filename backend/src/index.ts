@@ -5,6 +5,7 @@ import { env } from "./config/env";
 import { startCleanupJob } from "./jobs/cleanup.job";
 import { startVerificationTimeoutJob } from "./jobs/verificationTimeout.job";
 import { startEventIngestionJob } from "./jobs/eventIngestion.job";
+import { startCertificateIndexerJob } from "./jobs/certificateIndexer.job";
 import { startStorageHealthJob } from "./jobs/storageHealth.job";
 import { startKmsRotationJob } from "./jobs/kmsRotation.job";
 import { statusStreamService } from "./services/statusStream.service";
@@ -26,6 +27,9 @@ async function main(): Promise<void> {
     env.STELLAR_ORACLE_CONTRACT_ID && env.STELLAR_PROVENANCE_CONTRACT_ID
       ? startEventIngestionJob()
       : undefined;
+  const stopCertificateIndexer = env.STELLAR_PROVENANCE_CONTRACT_ID
+    ? startCertificateIndexerJob()
+    : undefined;
 
   const kmsRotationJob = startKmsRotationJob();
 
@@ -43,7 +47,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     stopEventIngestion?.();
-    kmsRotationJob.stop();
+    stopCertificateIndexer?.();
     console.log(`[Server] ${signal} received — shutting down gracefully`);
     await statusStreamService.disconnectAll();
     server.close(async () => {

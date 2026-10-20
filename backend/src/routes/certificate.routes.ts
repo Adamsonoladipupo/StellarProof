@@ -148,6 +148,19 @@ router.get(
 );
 
 /**
+ * GET /api/v1/certificates/export.csv?creatorId=<ObjectId>&search=<term>
+ *
+ * Streams every certificate matching the same `creatorId` and `search`
+ * filters as the list endpoint as `text/csv`. `limit` and `skip` are accepted
+ * for parity with the list endpoint but do not paginate the export.
+ */
+router.get(
+  "/export.csv",
+  validateListCertificatesQuery,
+  certificateController.exportCertificatesCsv.bind(certificateController)
+);
+
+/**
  * GET /api/v1/certificates?creatorId=<ObjectId>&search=<term>&limit=20&skip=0
  *
  * Query parameters:

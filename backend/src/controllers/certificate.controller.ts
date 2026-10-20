@@ -1,8 +1,26 @@
+import { once } from "events";
 import type { Request, Response, NextFunction } from "express";
 import { StatusCodes } from "http-status-codes";
 import { AppError } from "../errors/AppError";
 import { certificateService } from "../services/certificate.service";
 import type { ListCertificatesQuery } from "../types/certificate.types";
+import logger from "../utils/logger";
+import { toCsvLine } from "../utils/csv";
+
+/** Export columns, in order. Each entry maps a header to a document field. */
+const CSV_COLUMNS = [
+  "certificateId",
+  "stellarNetwork",
+  "contractAddress",
+  "transactionHash",
+  "ledgerSequence",
+  "mintedAt",
+  "creatorId",
+  "assetId",
+  "manifestId",
+  "verificationJobId",
+  "createdAt",
+] as const;
 
 export class CertificateController {
   async listCertificates(
@@ -50,6 +68,50 @@ export class CertificateController {
         success: true,
         data: certificate,
       });
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  /**
+   * GET /api/v1/certificates/export.csv
+   * Streams every certificate matching the list filters as CSV. Rows are read
+   * from MongoDB in batches and written with backpressure, so memory use does
+   * not grow with the size of the export.
+   */
+  async exportCertificatesCsv(
+    req: Request,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      const cursor = certificateService.streamCertificatesForExport(
+        req.query as unknown as ListCertificatesQuery
+      );
+
+      res.status(StatusCodes.OK);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader("Content-Disposition", 'attachment; filename="certificates.csv"');
+      res.write(toCsvLine(CSV_COLUMNS));
+
+      try {
+        for await (const certificate of cursor) {
+          if (res.destroyed) break;
+          const row = CSV_COLUMNS.map((column) => certificate[column]);
+          if (!res.write(toCsvLine(row))) {
+            await once(res, "drain");
+          }
+        }
+        res.end();
+      } catch (err) {
+        // Headers are already sent, so the response cannot become a JSON error.
+        logger.error("Certificate CSV export failed mid-stream", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+        res.destroy(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        await cursor.close().catch(() => undefined);
+      }
     } catch (err) {
       next(err);
     }

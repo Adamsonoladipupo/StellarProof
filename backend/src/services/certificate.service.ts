@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+import mongoose, { type FilterQuery } from "mongoose";
 import { StatusCodes } from "http-status-codes";
 import Certificate, { type ICertificate } from "../models/Certificate.model";
 import { AppError } from "../errors/AppError";
@@ -25,50 +25,53 @@ function escapeRegex(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-/** Number of calendar months (UTC) in the creator dashboard mint series. */
-const MONTHLY_SERIES_LENGTH = 12;
+/**
+ * Builds the Mongo filter shared by the paginated list and the CSV export, so
+ * both return the same set of certificates for the same query.
+ */
+function buildCertificateFilter(creatorId?: string, search?: string): FilterQuery<ICertificate> {
+  const conditions: FilterQuery<ICertificate>[] = [];
 
-/** Matches a certificate by MongoDB `_id` or on-chain `certificateId`. */
-function certificateLookupQuery(id: string): Record<string, unknown> {
-  return mongoose.Types.ObjectId.isValid(id)
-    ? { $or: [{ _id: id }, { certificateId: id }] }
-    : { certificateId: id };
-}
-
-/** First instant (UTC) of the month `offset` months away from `date`'s month. */
-function startOfUtcMonth(date: Date, offset = 0): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + offset, 1));
-}
-
-function formatUtcMonth(date: Date): string {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}`;
-}
-
-/** Oldest-first, zero-filled series of the last 12 UTC months ending at `now`. */
-function buildMonthlySeries(
-  rows: { _id: string; minted: number }[],
-  now: Date
-): CertificateMonthlyMintCount[] {
-  const counts = new Map(rows.map((row) => [row._id, row.minted]));
-  const series: CertificateMonthlyMintCount[] = [];
-  for (let offset = -(MONTHLY_SERIES_LENGTH - 1); offset <= 0; offset += 1) {
-    const month = formatUtcMonth(startOfUtcMonth(now, offset));
-    series.push({ month, minted: counts.get(month) ?? 0 });
+  // Per-owner listing when creatorId is supplied; otherwise the query
+  // targets the public global certificate index.
+  if (creatorId) {
+    conditions.push({ creatorId: new mongoose.Types.ObjectId(creatorId) });
   }
-  return series;
+
+  // Full-text-ish search across the on-chain identifiers of a certificate.
+  if (search) {
+    const matcher = { $regex: escapeRegex(search), $options: "i" };
+    conditions.push({
+      $or: [
+        { certificateId: matcher },
+        { transactionHash: matcher },
+        { contractAddress: matcher },
+      ],
+    });
+  }
+
+  return conditions.length > 0 ? { $and: conditions } : {};
 }
 
-function toRevocationStatus(
-  cached: PopulatedVerificationCertificate
-): CertificateRevocationStatus {
-  const revoked = cached.revoked === true;
-  return {
-    revoked,
-    revokedAt: revoked && cached.revokedAt
-      ? new Date(cached.revokedAt).toISOString()
-      : null,
-  };
+/** Lean certificate document as read for CSV export (no populated relations). */
+export interface CertificateExportRecord {
+  certificateId: string;
+  stellarNetwork: string;
+  contractAddress: string;
+  transactionHash: string;
+  ledgerSequence: number;
+  mintedAt: Date;
+  creatorId: mongoose.Types.ObjectId;
+  assetId: mongoose.Types.ObjectId;
+  manifestId: mongoose.Types.ObjectId;
+  verificationJobId: mongoose.Types.ObjectId;
+  createdAt: Date;
 }
+
+/** Streaming view of a Mongo query cursor: iterable, and closable on early exit. */
+export type CertificateExportCursor = AsyncIterable<CertificateExportRecord> & {
+  close(): Promise<void>;
+};
 
 /** Certificate cache document with the relations required for verification. */
 interface PopulatedVerificationCertificate {
@@ -127,27 +130,7 @@ export class CertificateService {
       );
     }
 
-    const conditions: Record<string, unknown>[] = [];
-
-    // Per-owner listing when creatorId is supplied; otherwise the query
-    // targets the public global certificate index.
-    if (creatorId) {
-      conditions.push({ creatorId: new mongoose.Types.ObjectId(creatorId) });
-    }
-
-    // Full-text-ish search across the on-chain identifiers of a certificate.
-    if (search) {
-      const matcher = { $regex: escapeRegex(search), $options: "i" };
-      conditions.push({
-        $or: [
-          { certificateId: matcher },
-          { transactionHash: matcher },
-          { contractAddress: matcher },
-        ],
-      });
-    }
-
-    const filter = conditions.length > 0 ? { $and: conditions } : {};
+    const filter = buildCertificateFilter(creatorId, search);
 
     const [certificates, total] = await Promise.all([
       Certificate.find(filter)
@@ -163,6 +146,32 @@ export class CertificateService {
     ]);
 
     return { certificates, total, limit, skip };
+  }
+
+  /**
+   * Returns a lazy cursor over every certificate matching the list filters.
+   * Pagination is not applied: an export covers the full filtered set and is
+   * read from MongoDB in batches so memory stays flat for large exports.
+   *
+   * @throws {AppError} 400 when `creatorId` is not a valid ObjectId.
+   */
+  streamCertificatesForExport(
+    query: Pick<ListCertificatesQuery, "creatorId" | "search">
+  ): CertificateExportCursor {
+    const { creatorId, search } = query;
+
+    if (creatorId && !mongoose.Types.ObjectId.isValid(creatorId)) {
+      throw new AppError(
+        "creatorId must be a valid MongoDB ObjectId",
+        StatusCodes.BAD_REQUEST,
+        "INVALID_CREATOR_ID"
+      );
+    }
+
+    return Certificate.find(buildCertificateFilter(creatorId, search))
+      .sort({ mintedAt: -1, createdAt: -1 })
+      .lean<CertificateExportRecord>()
+      .cursor();
   }
 
   async getCertificateById(id: string): Promise<ICertificate | null> {
