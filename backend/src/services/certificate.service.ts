@@ -1,4 +1,4 @@
-import mongoose from "mongoose";
+import mongoose, { type FilterQuery } from "mongoose";
 import { StatusCodes } from "http-status-codes";
 import Certificate, { type ICertificate } from "../models/Certificate.model";
 import { AppError } from "../errors/AppError";
@@ -19,6 +19,54 @@ import type {
 function escapeRegex(input: string): string {
   return input.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+/**
+ * Builds the Mongo filter shared by the paginated list and the CSV export, so
+ * both return the same set of certificates for the same query.
+ */
+function buildCertificateFilter(creatorId?: string, search?: string): FilterQuery<ICertificate> {
+  const conditions: FilterQuery<ICertificate>[] = [];
+
+  // Per-owner listing when creatorId is supplied; otherwise the query
+  // targets the public global certificate index.
+  if (creatorId) {
+    conditions.push({ creatorId: new mongoose.Types.ObjectId(creatorId) });
+  }
+
+  // Full-text-ish search across the on-chain identifiers of a certificate.
+  if (search) {
+    const matcher = { $regex: escapeRegex(search), $options: "i" };
+    conditions.push({
+      $or: [
+        { certificateId: matcher },
+        { transactionHash: matcher },
+        { contractAddress: matcher },
+      ],
+    });
+  }
+
+  return conditions.length > 0 ? { $and: conditions } : {};
+}
+
+/** Lean certificate document as read for CSV export (no populated relations). */
+export interface CertificateExportRecord {
+  certificateId: string;
+  stellarNetwork: string;
+  contractAddress: string;
+  transactionHash: string;
+  ledgerSequence: number;
+  mintedAt: Date;
+  creatorId: mongoose.Types.ObjectId;
+  assetId: mongoose.Types.ObjectId;
+  manifestId: mongoose.Types.ObjectId;
+  verificationJobId: mongoose.Types.ObjectId;
+  createdAt: Date;
+}
+
+/** Streaming view of a Mongo query cursor: iterable, and closable on early exit. */
+export type CertificateExportCursor = AsyncIterable<CertificateExportRecord> & {
+  close(): Promise<void>;
+};
 
 /** Certificate cache document with the relations required for verification. */
 interface PopulatedVerificationCertificate {
@@ -75,27 +123,7 @@ export class CertificateService {
       );
     }
 
-    const conditions: Record<string, unknown>[] = [];
-
-    // Per-owner listing when creatorId is supplied; otherwise the query
-    // targets the public global certificate index.
-    if (creatorId) {
-      conditions.push({ creatorId: new mongoose.Types.ObjectId(creatorId) });
-    }
-
-    // Full-text-ish search across the on-chain identifiers of a certificate.
-    if (search) {
-      const matcher = { $regex: escapeRegex(search), $options: "i" };
-      conditions.push({
-        $or: [
-          { certificateId: matcher },
-          { transactionHash: matcher },
-          { contractAddress: matcher },
-        ],
-      });
-    }
-
-    const filter = conditions.length > 0 ? { $and: conditions } : {};
+    const filter = buildCertificateFilter(creatorId, search);
 
     const [certificates, total] = await Promise.all([
       Certificate.find(filter)
@@ -111,6 +139,32 @@ export class CertificateService {
     ]);
 
     return { certificates, total, limit, skip };
+  }
+
+  /**
+   * Returns a lazy cursor over every certificate matching the list filters.
+   * Pagination is not applied: an export covers the full filtered set and is
+   * read from MongoDB in batches so memory stays flat for large exports.
+   *
+   * @throws {AppError} 400 when `creatorId` is not a valid ObjectId.
+   */
+  streamCertificatesForExport(
+    query: Pick<ListCertificatesQuery, "creatorId" | "search">
+  ): CertificateExportCursor {
+    const { creatorId, search } = query;
+
+    if (creatorId && !mongoose.Types.ObjectId.isValid(creatorId)) {
+      throw new AppError(
+        "creatorId must be a valid MongoDB ObjectId",
+        StatusCodes.BAD_REQUEST,
+        "INVALID_CREATOR_ID"
+      );
+    }
+
+    return Certificate.find(buildCertificateFilter(creatorId, search))
+      .sort({ mintedAt: -1, createdAt: -1 })
+      .lean<CertificateExportRecord>()
+      .cursor();
   }
 
   async getCertificateById(id: string): Promise<ICertificate | null> {

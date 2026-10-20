@@ -34,7 +34,8 @@ export const getActiveKey = async (req: Request, res: Response): Promise<void> =
 export const revokeKey = async (req: Request, res: Response): Promise<void> => {
   try {
     const { keyId } = req.params;
-    const key = await kmsService.revokeKey(keyId);
+    const actorId = req.user ? String(req.user._id) : undefined;
+    const key = await kmsService.revokeKey(keyId, actorId);
     res.status(200).json({ success: true, data: key });
   } catch (error) {
     res.status(500).json({ success: false, error: (error as Error).message });

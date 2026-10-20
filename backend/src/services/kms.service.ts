@@ -4,6 +4,7 @@ import KMSKey, { IKMSKey } from '../models/KMSKey.model';
 import Asset from '../models/Asset.model';
 import { cloudinaryService } from './cloudinary.service';
 import { ipfsService } from './ipfs.service';
+import { kmsAuditService } from './kmsAudit.service';
 import { v2 as cloudinary } from 'cloudinary';
 
 const ALGORITHM = 'aes-256-gcm';
@@ -120,16 +121,36 @@ export class KmsService {
   }
 
   /**
-   * Revokes a KMS key
+   * Revokes a KMS key. The state change and its audit row commit together.
+   * @param actorId The user performing the revocation, when known.
    */
-  async revokeKey(keyId: string): Promise<IKMSKey> {
-    const key = await KMSKey.findById(keyId);
-    if (!key) throw new Error('KMS key not found');
-    if (!key.isActive) throw new Error('KMS key is already inactive');
+  async revokeKey(keyId: string, actorId?: string): Promise<IKMSKey> {
+    const session = await mongoose.startSession();
+    try {
+      let revoked: IKMSKey | undefined;
+      await session.withTransaction(async () => {
+        const key = await KMSKey.findById(keyId).session(session);
+        if (!key) throw new Error('KMS key not found');
+        if (!key.isActive) throw new Error('KMS key is already inactive');
 
-    key.isActive = false;
-    await key.save();
-    return key;
+        key.isActive = false;
+        await key.save({ session });
+        await kmsAuditService.record(
+          {
+            action: 'revoke',
+            actorId,
+            keyId: key._id,
+            keyVersion: key.keyVersion,
+          },
+          session
+        );
+        revoked = key;
+      });
+      if (!revoked) throw new Error('KMS key revocation did not complete');
+      return revoked;
+    } finally {
+      session.endSession();
+    }
   }
 
   /**
@@ -224,6 +245,20 @@ export class KmsService {
       });
 
       await newKey.save({ session });
+      await kmsAuditService.record(
+        {
+          action: 'rotate',
+          actorId: userId,
+          keyId: newKey._id,
+          keyVersion: newKeyVersion,
+          metadata: {
+            previousKeyId: activeKey._id.toString(),
+            previousKeyVersion: oldKeyVersion,
+            assetsReEncrypted: assetsToReEncrypt.length,
+          },
+        },
+        session
+      );
       await session.commitTransaction();
 
       return {

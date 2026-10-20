@@ -364,7 +364,9 @@ import mongoose from 'mongoose';
 import SPVRecordModel, { ISPVRecord } from '../models/SPVRecord.model';
 import KMSKey from '../models/KMSKey.model';
 import Asset, { IAsset } from '../models/Asset.model';
+import User from '../models/User.model';
 import { AppError } from '../errors/AppError';
+import { accessControlService } from './accessControl.service';
 
 export type SupportedStorageProvider = 'cloudinary' | 'ipfs';
 
@@ -569,25 +571,22 @@ return {
       throw new Error('Asset not found');
     }
 
-    // Authorization check
-    if (spvRecord.accessType === 'private') {
-      if (!asset.creatorId.equals(requestingUserId)) {
-        throw new Error('Unauthorized: Private access only');
+    // Authorization: policy resolution lives in accessControlService (fails closed).
+    const requester = await User.findById(requestingUserId)
+      .select('stellarPublicKey')
+      .lean<{ stellarPublicKey?: string | null }>();
+    await accessControlService.assertCanUnseal(
+      {
+        accessType: spvRecord.accessType,
+        allowedUsers: spvRecord.allowedUsers,
+        nftContractAddress: spvRecord.nftContractAddress,
+      },
+      {
+        userId: requestingUserId,
+        ownerId: asset.creatorId,
+        stellarPublicKey: requester?.stellarPublicKey ?? null,
       }
-    } else if (spvRecord.accessType === 'nft_holders_only') {
-      const isHolder = await this.checkNFTHolder(requestingUserId, asset);
-      if (!isHolder) {
-        throw new Error('Unauthorized: Must be an NFT holder');
-      }
-    } else if (spvRecord.accessType === 'specific_users') {
-      const isCreator = asset.creatorId.equals(requestingUserId);
-      const isAllowed = spvRecord.allowedUsers?.some((id: mongoose.Types.ObjectId) => id.equals(requestingUserId));
-      if (!isCreator && !isAllowed) {
-        throw new Error('Unauthorized: You do not have permission to access this asset');
-      }
-    } else if (spvRecord.accessType !== 'public_with_conditions') {
-      throw new Error('Unauthorized: Invalid access type');
-    }
+    );
 
     // Fetch encrypted payload
     const encryptedPayload = await this.fetchEncryptedPayload(asset);
@@ -600,11 +599,6 @@ return {
       buffer: decryptedBuffer,
       contentType: asset.mimeType || 'application/octet-stream',
     };
-  }
-
-  private async checkNFTHolder(userId: mongoose.Types.ObjectId, asset: IAsset): Promise<boolean> {
-    // Placeholder for actual NFT verification logic against Stellar blockchain
-    return true; 
   }
 
   private async fetchEncryptedPayload(asset: IAsset): Promise<Buffer> {
