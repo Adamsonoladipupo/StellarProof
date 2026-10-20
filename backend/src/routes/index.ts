@@ -4,6 +4,7 @@
  */
 import { Router, type Request, type Response } from "express";
 import certificateRoutes from "./certificate.routes";
+import certificateRevocationRoutes from "./certificate.revocation.routes";
 import spvRoutes from "./spv.routes";
 import verificationRoutes from "./verification.routes";
 import manifestRoutes from "./manifest.routes";
@@ -34,6 +35,7 @@ router.get("/health", (_req: Request, res: Response): void => {
 });
 
 router.use("/api/v1/certificates", certificateRoutes);
+router.use("/api/v1/certificates", certificateRevocationRoutes);
 router.use("/api/v1/manifests", manifestRoutes);
 router.use("/api/v1/spv/records", spvRoutes);
 router.use("/api/v1/verification/jobs", verificationRoutes);

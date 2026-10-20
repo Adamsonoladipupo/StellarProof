@@ -364,6 +364,7 @@ import mongoose from 'mongoose';
 import SPVRecordModel, { ISPVRecord } from '../models/SPVRecord.model';
 import KMSKey from '../models/KMSKey.model';
 import Asset, { IAsset } from '../models/Asset.model';
+import Certificate from '../models/Certificate.model';
 import { AppError } from '../errors/AppError';
 
 export type SupportedStorageProvider = 'cloudinary' | 'ipfs';
@@ -531,8 +532,68 @@ return {
   async getUserSPVRecords(userId: mongoose.Types.ObjectId): Promise<ISPVRecord[]> {
     return SPVRecordModel.find({ creatorId: userId })
       .populate('assetId')
+      .populate('certificateId', 'certificateId transactionHash mintedAt')
+      .populate('verificationJobId', 'status contentHash')
       .sort({ createdAt: -1 })
       .exec();
+  }
+
+  /**
+   * Links the vault of an asset to the certificate minted for it.
+   * Only records without an existing link are updated, so a later mint can
+   * never silently re-point a vault, and re-running the call is a no-op.
+   *
+   * @returns the number of SPV records that were linked (0 or 1).
+   */
+  async linkCertificate(params: {
+    assetId: mongoose.Types.ObjectId;
+    certificateId: mongoose.Types.ObjectId;
+    verificationJobId: mongoose.Types.ObjectId;
+  }): Promise<number> {
+    const result = await SPVRecordModel.updateOne(
+      { assetId: params.assetId, certificateId: { $exists: false } },
+      {
+        $set: {
+          certificateId: params.certificateId,
+          verificationJobId: params.verificationJobId,
+        },
+      }
+    );
+    return result.modifiedCount;
+  }
+
+  /**
+   * Backfills certificate/job links on SPV records created before linkage
+   * existed. Joins on assetId and uses the most recently minted certificate
+   * for each asset. Records that already have a link are skipped, so the
+   * backfill is safe to re-run.
+   */
+  async backfillCertificateLinks(): Promise<{ scanned: number; linked: number }> {
+    let scanned = 0;
+    let linked = 0;
+
+    const pending = SPVRecordModel.find({ certificateId: { $exists: false } })
+      .select('assetId')
+      .lean<{ _id: mongoose.Types.ObjectId; assetId: mongoose.Types.ObjectId }>()
+      .cursor();
+
+    for await (const record of pending) {
+      scanned += 1;
+      const certificate = await Certificate.findOne({ assetId: record.assetId })
+        .sort({ mintedAt: -1 })
+        .select('_id verificationJobId')
+        .lean<{ _id: mongoose.Types.ObjectId; verificationJobId: mongoose.Types.ObjectId }>();
+
+      if (!certificate) continue;
+
+      linked += await this.linkCertificate({
+        assetId: record.assetId,
+        certificateId: certificate._id,
+        verificationJobId: certificate.verificationJobId,
+      });
+    }
+
+    return { scanned, linked };
   }
 
   async updateSealedStatus(

@@ -12,6 +12,14 @@
  *     Publicly verifies a certificate by cross-checking the off-chain cache
  *     against `provenance.get_certificate` and returning `{ valid, details }`.
  *
+ *   GET /api/v1/certificates/stats?creatorId=<ObjectId>
+ *     Creator dashboard metrics: total minted, unique verified assets and a
+ *     trailing 12-month mint series.
+ *
+ *   POST /api/v1/certificates/:id/revoke (authenticated; see
+ *     certificate.revocation.routes.ts)
+ *     Owner or admin records an off-chain revocation.
+ *
  * All Zod schemas are co-located with the routes that use them.
  */
 import { Router } from "express";
@@ -165,6 +173,17 @@ router.get(
   "/",
   validateListCertificatesQuery,
   certificateController.listCertificates.bind(certificateController)
+);
+
+/**
+ * GET /api/v1/certificates/stats?creatorId=<ObjectId>
+ *
+ * Creator dashboard metrics: `totalMinted`, `uniqueAssetsVerified` and a
+ * zero-filled trailing 12-month `monthlySeries` (UTC, oldest first).
+ */
+router.get(
+  "/stats",
+  certificateController.getCertificateStats.bind(certificateController)
 );
 
 export default router;

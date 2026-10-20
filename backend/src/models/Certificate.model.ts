@@ -19,6 +19,13 @@ export interface ICertificate extends Document {
   ledgerSequence: number;        // The Stellar ledger block where this was minted
   
   mintedAt: Date;                // Blockchain timestamp
+
+  // Off-chain revocation flag. Recorded in this cache only; the on-chain
+  // certificate remains the source of truth and is never mutated here.
+  revoked: boolean;
+  revokedAt?: Date;
+  revokedBy?: mongoose.Types.ObjectId;
+
   createdAt: Date;
   updatedAt: Date;
 }
@@ -75,7 +82,21 @@ const CertificateSchema: Schema = new Schema(
     mintedAt: {
       type: Date,
       required: true,
-    }
+    },
+    revoked: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    revokedAt: {
+      type: Date,
+      default: undefined,
+    },
+    revokedBy: {
+      type: Schema.Types.ObjectId,
+      ref: 'User',
+      default: undefined,
+    },
   },
   { timestamps: true }
 );

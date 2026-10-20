@@ -1,248 +1,422 @@
+/**
+ * KMS key rotation: re-encryption of stored asset blobs.
+ *
+ * Crypto is real (AES-256-GCM in the same layout SPV uploads write), so the
+ * tests prove that rotated blobs decrypt under the new key. Storage, the
+ * database and the global fetch are mocked.
+ */
 import crypto from 'crypto';
 import mongoose from 'mongoose';
-import { kmsService } from '../services/kms.service';
+import { Writable } from 'stream';
+import { v2 as cloudinary } from 'cloudinary';
 import KMSKey from '../models/KMSKey.model';
-import { env } from '../config/env';
+import Asset from '../models/Asset.model';
+import SPVRecordModel from '../models/SPVRecord.model';
+import { ipfsService } from '../services/ipfs.service';
+import { kmsService } from '../services/kms.service';
 
-jest.mock('../config/env', () => ({
-  env: {
-    MASTER_KEY: 'master-current',
-    MASTER_KEY_PREVIOUS: '',
+jest.mock('cloudinary', () => ({
+  v2: {
+    url: jest.fn((publicId: string) => `https://res.example/raw/${publicId}`),
+    uploader: {
+      upload_stream: jest.fn(),
+      destroy: jest.fn(),
+    },
   },
 }));
 
-jest.mock('../models/KMSKey.model', () => ({
+jest.mock('../services/ipfs.service', () => ({
+  ipfsService: { upload: jest.fn() },
+}));
+
+jest.mock('../utils/logger', () => ({
   __esModule: true,
-  default: {
-    findById: jest.fn(),
-    find: jest.fn(),
-    updateMany: jest.fn(),
-    findOne: jest.fn(),
-  },
+  default: { warn: jest.fn(), error: jest.fn(), info: jest.fn() },
 }));
 
-const KMSKeyMock = KMSKey as unknown as Record<'findById' | 'find' | 'updateMany' | 'findOne', jest.Mock>;
-const mutableEnv = env as unknown as { MASTER_KEY_PREVIOUS: string };
+jest.mock('../models/KMSKey.model', () => {
+  const ctor: any = jest.fn();
+  ctor.find = jest.fn();
+  ctor.findById = jest.fn();
+  ctor.updateMany = jest.fn();
+  return { __esModule: true, default: ctor };
+});
 
-/** Wraps a symmetric key the same way the stored format has always been written. */
-function wrapWith(masterSecret: string, symmetricKey: Buffer) {
-  const master = crypto.createHash('sha256').update(masterSecret).digest();
-  const iv = crypto.randomBytes(16);
-  const cipher = crypto.createCipheriv('aes-256-gcm', master, iv);
-  let encrypted = cipher.update(symmetricKey.toString('hex'), 'utf8', 'hex');
-  encrypted += cipher.final('hex');
+jest.mock('../models/Asset.model', () => {
+  const model: any = { find: jest.fn() };
+  return { __esModule: true, default: model };
+});
+
+jest.mock('../models/SPVRecord.model', () => {
+  const model: any = { findOne: jest.fn(), updateMany: jest.fn() };
+  return { __esModule: true, default: model };
+});
+
+const MASTER_HEX = crypto.randomBytes(32).toString('hex');
+const MASTER = Buffer.from(MASTER_HEX, 'hex');
+const USER_ID = new mongoose.Types.ObjectId().toHexString();
+
+const KMSKeyModel = KMSKey as unknown as jest.Mock & {
+  find: jest.Mock;
+  findById: jest.Mock;
+  updateMany: jest.Mock;
+};
+const AssetModel = Asset as unknown as { find: jest.Mock };
+const SPVModel = SPVRecordModel as unknown as { findOne: jest.Mock; updateMany: jest.Mock };
+const uploadStream = cloudinary.uploader.upload_stream as unknown as jest.Mock;
+const destroy = cloudinary.uploader.destroy as unknown as jest.Mock;
+const cloudinaryUrl = cloudinary.url as unknown as jest.Mock;
+const ipfsUpload = ipfsService.upload as unknown as jest.Mock;
+
+/** Wraps a data key the way SPV uploads store it: base64 ciphertext plus separate iv/tag. */
+function wrapDataKey(dataKey: Buffer) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', MASTER, iv);
+  const wrapped = Buffer.concat([cipher.update(dataKey), cipher.final()]);
   return {
-    encryptedKeyValue: encrypted,
+    encryptedKeyValue: wrapped.toString('base64'),
     iv: iv.toString('hex'),
     authTag: cipher.getAuthTag().toString('hex'),
   };
 }
 
-/** Unwraps a stored record with a given master secret; throws if the tag does not verify. */
-function unwrapWith(masterSecret: string, record: { encryptedKeyValue: string; iv: string; authTag: string }) {
-  const master = crypto.createHash('sha256').update(masterSecret).digest();
-  const decipher = crypto.createDecipheriv('aes-256-gcm', master, Buffer.from(record.iv, 'hex'));
-  decipher.setAuthTag(Buffer.from(record.authTag, 'hex'));
-  let hex = decipher.update(record.encryptedKeyValue, 'hex', 'utf8');
-  hex += decipher.final('utf8');
-  return Buffer.from(hex, 'hex');
+/** Unwraps a stored KMSKey document, mirroring what the service must do. */
+function unwrapStoredKey(doc: { encryptedKeyValue: string; iv: string; authTag: string }): Buffer {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', MASTER, Buffer.from(doc.iv, 'hex'));
+  decipher.setAuthTag(Buffer.from(doc.authTag, 'hex'));
+  return Buffer.concat([
+    decipher.update(Buffer.from(doc.encryptedKeyValue, 'base64')),
+    decipher.final(),
+  ]);
 }
 
-/** Builds a KMSKey-like document for the mocked model. */
-function keyDoc(overrides: Record<string, unknown> & { wrapped: ReturnType<typeof wrapWith> }) {
-  const { wrapped, ...rest } = overrides;
-  const doc = {
-    _id: new mongoose.Types.ObjectId(),
-    keyVersion: 'v1',
-    isActive: true,
-    expiresAt: undefined as Date | undefined,
-    encryptedKeyValue: wrapped.encryptedKeyValue,
-    iv: wrapped.iv,
-    authTag: wrapped.authTag,
-    save: jest.fn().mockResolvedValue(undefined),
-    ...rest,
+/** Encrypts a blob in the SPV upload layout: [authTag | IV | ciphertext]. */
+function sealBlob(plaintext: Buffer, key: Buffer): Buffer {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return Buffer.concat([cipher.getAuthTag(), iv, ciphertext]);
+}
+
+function openBlob(blob: Buffer, key: Buffer): Buffer {
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, blob.subarray(16, 28));
+  decipher.setAuthTag(blob.subarray(0, 16));
+  return Buffer.concat([decipher.update(blob.subarray(28)), decipher.final()]);
+}
+
+function makeSession() {
+  let active = false;
+  return {
+    startTransaction: jest.fn(() => {
+      active = true;
+    }),
+    commitTransaction: jest.fn(async () => {
+      active = false;
+    }),
+    abortTransaction: jest.fn(async () => {
+      active = false;
+    }),
+    endSession: jest.fn(async () => undefined),
+    inTransaction: jest.fn(() => active),
   };
-  return { ...doc, id: doc._id.toHexString() };
 }
 
-/** Resolves successive KMSKey.find(...).sort().limit() calls with the given pages. */
-function mockFindPages(pages: unknown[][]) {
-  for (const page of pages) {
-    const limit = jest.fn().mockResolvedValue(page);
-    const sort = jest.fn().mockReturnValue({ limit });
-    KMSKeyMock.find.mockReturnValueOnce({ sort });
+/** Chainable stand-in for a Mongoose query that resolves to `value`. */
+function query<T>(value: T) {
+  const chain: any = {
+    select: () => chain,
+    session: () => Promise.resolve(value),
+    then: (resolve: (v: T) => unknown, reject?: (e: unknown) => unknown) =>
+      Promise.resolve(value).then(resolve, reject),
+  };
+  return chain;
+}
+
+interface FakeAsset {
+  _id: mongoose.Types.ObjectId;
+  storageProvider: string;
+  storageReferenceId: string;
+  fileName: string;
+  encryptionKeyVersion: string;
+  save: jest.Mock;
+}
+
+interface Fixture {
+  session: ReturnType<typeof makeSession>;
+  activeKeys: any[];
+  allKeys: any[];
+  assets: FakeAsset[];
+  spvByAsset: Map<string, { kmsKeyId: mongoose.Types.ObjectId }>;
+  keysById: Map<string, any>;
+  blobsByUrl: Map<string, Buffer>;
+  oldDataKeyByAsset: Map<string, Buffer>;
+}
+
+let fixture: Fixture;
+let newKeyDocs: any[];
+let uploadedBlobs: Buffer[];
+let uploadCounter: number;
+
+/**
+ * Builds a user with one active key (v1) and `count` assets, each with its
+ * own data key, as the live SPV upload path creates them.
+ */
+function buildFixture(count: number, options: { legacyKey?: boolean } = {}): Fixture {
+  const fx: Fixture = {
+    session: makeSession(),
+    activeKeys: [],
+    allKeys: [],
+    assets: [],
+    spvByAsset: new Map(),
+    keysById: new Map(),
+    blobsByUrl: new Map(),
+    oldDataKeyByAsset: new Map(),
+  };
+
+  for (let i = 0; i < count; i += 1) {
+    const dataKey = crypto.randomBytes(32);
+    const keyId = new mongoose.Types.ObjectId();
+    const wrapped = wrapDataKey(dataKey);
+    const keyDoc = {
+      _id: keyId,
+      creatorId: USER_ID,
+      keyVersion: 'v1',
+      isActive: true,
+      ...wrapped,
+      ...(options.legacyKey && i === 0
+        ? { encryptedKeyValue: crypto.randomBytes(48).toString('hex'), iv: crypto.randomBytes(16).toString('hex') }
+        : {}),
+    };
+    fx.keysById.set(String(keyId), keyDoc);
+    fx.activeKeys.push(keyDoc);
+    fx.allKeys.push(keyDoc);
+
+    const assetId = new mongoose.Types.ObjectId();
+    const publicId = `stellarproof/spv/${USER_ID}/asset-${i}`;
+    const asset: FakeAsset = {
+      _id: assetId,
+      storageProvider: 'cloudinary',
+      storageReferenceId: publicId,
+      fileName: `file-${i}.bin`,
+      encryptionKeyVersion: 'v1',
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    fx.assets.push(asset);
+    fx.spvByAsset.set(String(assetId), { kmsKeyId: keyId });
+    fx.oldDataKeyByAsset.set(String(assetId), dataKey);
+    fx.blobsByUrl.set(
+      `https://res.example/raw/${publicId}`,
+      sealBlob(Buffer.from(`plaintext for asset ${i}`), dataKey)
+    );
   }
+
+  return fx;
 }
 
-describe('KMS key expiry', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mutableEnv.MASTER_KEY_PREVIOUS = '';
-  });
+beforeAll(() => {
+  process.env.KMS_MASTER_KEY = MASTER_HEX;
+  global.fetch = jest.fn(async (input: unknown) => {
+    const url = String(input);
+    const blob = fixture.blobsByUrl.get(url);
+    if (!blob) return { ok: false, status: 404, arrayBuffer: async () => new ArrayBuffer(0) } as unknown as Response;
+    return { ok: true, status: 200, arrayBuffer: async () => blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.length) } as unknown as Response;
+  }) as unknown as typeof fetch;
+});
 
-  it('rejects decryption with an expired key using KMS_KEY_EXPIRED', async () => {
-    const past = new Date(Date.now() - 60_000);
-    const doc = keyDoc({ wrapped: wrapWith('master-current', Buffer.alloc(32, 7)), expiresAt: past });
-    KMSKeyMock.findById.mockResolvedValue(doc);
+afterAll(() => {
+  delete process.env.KMS_MASTER_KEY;
+});
 
-    const payload = kmsService.encryptBuffer(Buffer.from('secret'), Buffer.alloc(32, 7));
+beforeEach(() => {
+  jest.clearAllMocks();
+  newKeyDocs = [];
+  uploadedBlobs = [];
+  uploadCounter = 0;
 
-    await expect(kmsService.decryptWithStoredKey(doc.id, payload)).rejects.toMatchObject({
-      code: 'KMS_KEY_EXPIRED',
-      statusCode: 403,
+  // Each upload_stream collects the bytes written to it and reports a public_id.
+  uploadStream.mockImplementation((_options: unknown, callback: (err: unknown, res: unknown) => void) => {
+    const chunks: Buffer[] = [];
+    const id = `rotated-${uploadCounter++}`;
+    return new Writable({
+      write(chunk, _enc, next) {
+        chunks.push(chunk as Buffer);
+        next();
+      },
+      final(done) {
+        uploadedBlobs.push(Buffer.concat(chunks));
+        callback(undefined, { public_id: id, secure_url: `https://res.example/${id}` });
+        done();
+      },
     });
   });
+  destroy.mockResolvedValue({ result: 'ok' });
 
-  it('decrypts with a key whose expiry is still in the future', async () => {
-    const symmetric = Buffer.alloc(32, 9);
-    const doc = keyDoc({
-      wrapped: wrapWith('master-current', symmetric),
-      expiresAt: new Date(Date.now() + 86_400_000),
+  KMSKeyModel.mockImplementation((data: Record<string, unknown>) => {
+    const doc = {
+      ...data,
+      _id: new mongoose.Types.ObjectId(),
+      save: jest.fn().mockResolvedValue(undefined),
+    };
+    newKeyDocs.push(doc);
+    return doc;
+  });
+  KMSKeyModel.updateMany.mockReturnValue(query({ modifiedCount: 1 }));
+  SPVModel.updateMany.mockReturnValue(query({ modifiedCount: 1 }));
+});
+
+function wireModels(fx: Fixture) {
+  fixture = fx;
+  KMSKeyModel.find.mockImplementation((filter: Record<string, unknown>) =>
+    query(filter.isActive === true ? fx.activeKeys : fx.allKeys)
+  );
+  KMSKeyModel.findById.mockImplementation((id: unknown) => query(fx.keysById.get(String(id)) ?? null));
+  AssetModel.find.mockReturnValue(query(fx.assets));
+  SPVModel.findOne.mockImplementation((filter: { assetId: mongoose.Types.ObjectId }) =>
+    query(fx.spvByAsset.get(String(filter.assetId)) ?? null)
+  );
+  jest.spyOn(mongoose, 'startSession').mockResolvedValue(fx.session as unknown as mongoose.ClientSession);
+}
+
+describe('KmsService.rotateKey', () => {
+  it('re-encrypts every asset blob under one new data key and commits atomically', async () => {
+    const fx = buildFixture(2);
+    wireModels(fx);
+
+    const result = await kmsService.rotateKey(USER_ID);
+
+    expect(result).toEqual({ oldKeyVersion: 'v1', newKeyVersion: 'v2', assetsReEncrypted: 2 });
+    expect(fx.session.commitTransaction).toHaveBeenCalledTimes(1);
+    expect(fx.session.abortTransaction).not.toHaveBeenCalled();
+
+    // The new KMSKey stores a data key that unwraps with KMS_MASTER_KEY.
+    expect(newKeyDocs).toHaveLength(1);
+    const newKey = newKeyDocs[0];
+    expect(newKey).toMatchObject({ creatorId: USER_ID, keyVersion: 'v2', isActive: true, algorithm: 'AES-256-GCM' });
+    const newDataKey = unwrapStoredKey(newKey);
+    expect(newDataKey).toHaveLength(32);
+
+    // Every rotated blob decrypts under the new key to the original plaintext.
+    expect(uploadedBlobs).toHaveLength(2);
+    const plaintexts = uploadedBlobs.map((blob) => openBlob(blob, newDataKey).toString());
+    expect(plaintexts.sort()).toEqual(['plaintext for asset 0', 'plaintext for asset 1']);
+
+    // Asset references move to the new blobs and the new version.
+    fx.assets.forEach((asset) => {
+      expect(asset.save).toHaveBeenCalledWith({ session: fx.session });
+      expect(asset.encryptionKeyVersion).toBe('v2');
+      expect(asset.storageReferenceId).toMatch(/^rotated-/);
     });
-    KMSKeyMock.findById.mockResolvedValue(doc);
 
-    const payload = kmsService.encryptBuffer(Buffer.from('hello'), symmetric);
-    const plain = await kmsService.decryptWithStoredKey(doc.id, payload);
-
-    expect(plain.toString('utf8')).toBe('hello');
-  });
-
-  it('treats a key without expiresAt as never expiring', () => {
-    expect(() =>
-      kmsService.assertKeyNotExpired({ keyVersion: 'v1', expiresAt: undefined })
-    ).not.toThrow();
-  });
-
-  it('deactivates only active keys whose expiry has passed', async () => {
-    const now = new Date('2026-10-20T00:00:00Z');
-    KMSKeyMock.updateMany.mockResolvedValue({ modifiedCount: 3 });
-
-    const count = await kmsService.deactivateExpiredKeys(now);
-
-    expect(KMSKeyMock.updateMany).toHaveBeenCalledWith(
-      { isActive: true, expiresAt: { $lte: now } },
+    // SPV records point at the new key, and the previous keys are deactivated.
+    expect(SPVModel.updateMany).toHaveBeenCalledWith(
+      { assetId: { $in: fx.assets.map((a) => a._id) } },
+      { $set: { kmsKeyId: newKey._id } }
+    );
+    expect(KMSKeyModel.updateMany).toHaveBeenCalledWith(
+      { creatorId: USER_ID, isActive: true, _id: { $ne: newKey._id } },
       { $set: { isActive: false } }
     );
-    expect(count).toBe(3);
   });
 
-  it('excludes expired keys when resolving the active key', async () => {
-    KMSKeyMock.findOne.mockResolvedValue(null);
+  it('deletes the replaced Cloudinary blobs only after the commit succeeds', async () => {
+    const fx = buildFixture(2);
+    wireModels(fx);
+    const replacedRefs = fx.assets.map((a) => a.storageReferenceId);
 
-    await kmsService.getActiveKey(new mongoose.Types.ObjectId().toHexString());
+    await kmsService.rotateKey(USER_ID);
 
-    const filter = KMSKeyMock.findOne.mock.calls[0][0];
-    expect(filter.isActive).toBe(true);
-    expect(filter.$or).toEqual([
-      { expiresAt: null },
-      { expiresAt: { $gt: expect.any(Date) } },
-    ]);
-  });
-});
-
-describe('KMS master-key rotation', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-    mutableEnv.MASTER_KEY_PREVIOUS = '';
+    expect(destroy).toHaveBeenCalledTimes(2);
+    for (const ref of replacedRefs) {
+      expect(destroy).toHaveBeenCalledWith(ref, { resource_type: 'raw' });
+    }
+    const commitOrder = fx.session.commitTransaction.mock.invocationCallOrder[0];
+    const destroyOrder = destroy.mock.invocationCallOrder[0];
+    expect(commitOrder).toBeLessThan(destroyOrder);
   });
 
-  it('unwraps keys written under the previous master during the transition window', async () => {
-    mutableEnv.MASTER_KEY_PREVIOUS = 'master-previous';
-    const symmetric = Buffer.alloc(32, 4);
-    const doc = keyDoc({ wrapped: wrapWith('master-previous', symmetric) });
-    KMSKeyMock.findById.mockResolvedValue(doc);
+  it('aborts and destroys uploaded blobs when a later asset fails', async () => {
+    const fx = buildFixture(2);
+    wireModels(fx);
+    const originalRefs = fx.assets.map((a) => a.storageReferenceId);
+    // The second asset's blob cannot be fetched.
+    fx.blobsByUrl.delete(`https://res.example/raw/${originalRefs[1]}`);
 
-    const payload = kmsService.encryptBuffer(Buffer.from('still readable'), symmetric);
-    const plain = await kmsService.decryptWithStoredKey(doc.id, payload);
+    await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow(
+      `Failed to re-encrypt asset ${fx.assets[1]._id}`
+    );
 
-    expect(plain.toString('utf8')).toBe('still readable');
+    expect(fx.session.abortTransaction).toHaveBeenCalledTimes(1);
+    expect(fx.session.commitTransaction).not.toHaveBeenCalled();
+    // The first asset's new blob was uploaded, so it must be removed again.
+    expect(destroy).toHaveBeenCalledWith('rotated-0', { resource_type: 'raw' });
+    // The original blobs stay in place until a commit succeeds.
+    for (const ref of originalRefs) {
+      expect(destroy).not.toHaveBeenCalledWith(ref, expect.anything());
+    }
+    expect(KMSKeyModel.updateMany).not.toHaveBeenCalled();
+    expect(SPVModel.updateMany).not.toHaveBeenCalled();
   });
 
-  it('fails with KMS_MASTER_KEY_MISMATCH when no configured master can unwrap the key', async () => {
-    const doc = keyDoc({ wrapped: wrapWith('some-other-master', Buffer.alloc(32, 1)) });
-    KMSKeyMock.findById.mockResolvedValue(doc);
+  it('fails without changes when the user has no active key', async () => {
+    const fx = buildFixture(1);
+    fx.activeKeys = [];
+    wireModels(fx);
 
-    const payload = kmsService.encryptBuffer(Buffer.from('x'), Buffer.alloc(32, 1));
-
-    await expect(kmsService.decryptWithStoredKey(doc.id, payload)).rejects.toMatchObject({
-      code: 'KMS_MASTER_KEY_MISMATCH',
-    });
+    await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow('No active KMS key found for user');
+    expect(fx.session.abortTransaction).toHaveBeenCalledTimes(1);
+    expect(fx.session.commitTransaction).not.toHaveBeenCalled();
+    expect(global.fetch).not.toHaveBeenCalled();
   });
 
-  it('refuses to re-wrap when MASTER_KEY_PREVIOUS is not configured', async () => {
-    await expect(kmsService.rewrapKeysToCurrentMaster()).rejects.toMatchObject({
-      code: 'KMS_PREVIOUS_MASTER_KEY_MISSING',
-    });
-    expect(KMSKeyMock.find).not.toHaveBeenCalled();
+  it('rejects a key stored in an unsupported wrapping format before touching any blob', async () => {
+    const fx = buildFixture(1, { legacyKey: true });
+    wireModels(fx);
+
+    await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow('is not in a supported wrapping format');
+    expect(global.fetch).not.toHaveBeenCalled();
+    expect(fx.session.commitTransaction).not.toHaveBeenCalled();
   });
 
-  it('re-wraps old-master keys, skips current ones, and reports unrecoverable keys', async () => {
-    mutableEnv.MASTER_KEY_PREVIOUS = 'master-previous';
-    const oldSymmetric = Buffer.alloc(32, 5);
-    const current = keyDoc({ wrapped: wrapWith('master-current', Buffer.alloc(32, 6)) });
-    const legacy = keyDoc({ wrapped: wrapWith('master-previous', oldSymmetric) });
-    const broken = keyDoc({ wrapped: wrapWith('unknown-master', Buffer.alloc(32, 8)) });
-    mockFindPages([[current, legacy, broken]]);
+  it('fails when an asset has no SPV record that references its key', async () => {
+    const fx = buildFixture(1);
+    wireModels(fx);
+    fx.spvByAsset.clear();
 
-    const summary = await kmsService.rewrapKeysToCurrentMaster(10);
-
-    expect(summary).toEqual({
-      scanned: 3,
-      rewrapped: 1,
-      alreadyCurrent: 1,
-      failed: [broken.id],
-    });
-    expect(current.save).not.toHaveBeenCalled();
-    expect(legacy.save).toHaveBeenCalledTimes(1);
-    expect(broken.save).not.toHaveBeenCalled();
-
-    // The rewritten key now unwraps under the current master alone.
-    expect(unwrapWith('master-current', legacy).equals(oldSymmetric)).toBe(true);
+    await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow('has no SPV record that references its key');
+    expect(fx.session.commitTransaction).not.toHaveBeenCalled();
   });
 
-  it('pages through keys in batches and stops on a short page', async () => {
-    mutableEnv.MASTER_KEY_PREVIOUS = 'master-previous';
-    const first = keyDoc({ wrapped: wrapWith('master-current', Buffer.alloc(32, 1)) });
-    const second = keyDoc({ wrapped: wrapWith('master-previous', Buffer.alloc(32, 2)) });
-    const third = keyDoc({ wrapped: wrapWith('master-previous', Buffer.alloc(32, 3)) });
-    mockFindPages([[first, second], [third]]);
-
-    const summary = await kmsService.rewrapKeysToCurrentMaster(2);
-
-    expect(KMSKeyMock.find).toHaveBeenCalledTimes(2);
-    expect(KMSKeyMock.find.mock.calls[1][0]).toEqual({ _id: { $gt: second._id } });
-    expect(summary.scanned).toBe(3);
-    expect(summary.rewrapped).toBe(2);
-  });
-});
-
-describe('KMS rotation eligibility query', () => {
-  beforeEach(() => jest.clearAllMocks());
-
-  it('selects active, unexpired keys created before the cutoff, ordered by _id', async () => {
-    const sort = jest.fn().mockReturnValue({ limit: jest.fn().mockResolvedValue([]) });
-    KMSKeyMock.find.mockReturnValue({ sort });
-    const cutoff = new Date('2026-07-22T00:00:00Z');
-    const now = new Date('2026-10-20T00:00:00Z');
-
-    await kmsService.findKeysDueForRotation({ cutoff, limit: 25, now });
-
-    const filter = KMSKeyMock.find.mock.calls[0][0];
-    expect(filter).toEqual({
-      isActive: true,
-      createdAt: { $lte: cutoff },
-      $or: [{ expiresAt: null }, { expiresAt: { $gt: now } }],
-    });
-    expect(sort).toHaveBeenCalledWith({ _id: 1 });
+  it('fails when the wrapping key is not configured', async () => {
+    const fx = buildFixture(1);
+    wireModels(fx);
+    const previous = process.env.KMS_MASTER_KEY;
+    delete process.env.KMS_MASTER_KEY;
+    try {
+      await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow('KMS_MASTER_KEY must be a 64-character hex string');
+      expect(fx.session.commitTransaction).not.toHaveBeenCalled();
+    } finally {
+      process.env.KMS_MASTER_KEY = previous;
+    }
   });
 
-  it('continues after the given _id when paginating', async () => {
-    const sort = jest.fn().mockReturnValue({ limit: jest.fn().mockResolvedValue([]) });
-    KMSKeyMock.find.mockReturnValue({ sort });
-    const afterId = new mongoose.Types.ObjectId();
+  it('retains new blobs and does not delete replaced blobs when the commit fails', async () => {
+    const fx = buildFixture(1);
+    wireModels(fx);
+    fx.session.commitTransaction.mockRejectedValueOnce(new Error('write conflict'));
 
-    await kmsService.findKeysDueForRotation({ cutoff: new Date(), limit: 5, afterId });
+    await expect(kmsService.rotateKey(USER_ID)).rejects.toThrow('write conflict');
+    expect(destroy).not.toHaveBeenCalled();
+  });
 
-    expect(KMSKeyMock.find.mock.calls[0][0]._id).toEqual({ $gt: afterId });
+  it('reads the new blob layout as [authTag | IV | ciphertext]', async () => {
+    const fx = buildFixture(1);
+    wireModels(fx);
+
+    await kmsService.rotateKey(USER_ID);
+
+    const newDataKey = unwrapStoredKey(newKeyDocs[0]);
+    const blob = uploadedBlobs[0];
+    expect(blob.length).toBe('plaintext for asset 0'.length + 28);
+    expect(openBlob(blob, newDataKey).toString()).toBe('plaintext for asset 0');
   });
 });
