@@ -9,6 +9,11 @@ import type {
 import type {
   ListCertificatesQuery,
   CertificateListResult,
+  CertificateRequester,
+  CertificateStats,
+  CertificateStatsQuery,
+  CertificateMonthlyMintCount,
+  CertificateRevocationStatus,
   CertificateVerificationData,
   CertificateVerificationDetails,
   CertificateVerificationResult,
@@ -74,6 +79,8 @@ interface PopulatedVerificationCertificate {
   contractAddress: string;
   stellarNetwork: 'testnet' | 'mainnet';
   mintedAt: Date;
+  revoked?: boolean;
+  revokedAt?: Date | null;
   assetId?: { storageReferenceId?: string } | null;
   manifestId?: { manifestHash?: string; creator?: string } | null;
   creatorId?: { stellarPublicKey?: string } | null;
@@ -226,9 +233,111 @@ export class CertificateService {
       onChain,
       checks,
       mismatches,
+      revocation: toRevocationStatus(cached),
     };
 
     return { valid, details };
+  }
+
+  /**
+   * Records an off-chain revocation of a certificate. Only the certificate's
+   * owner or an admin may revoke it. The on-chain record is not touched.
+   *
+   * @throws {AppError} 404 when the certificate does not exist.
+   * @throws {AppError} 403 when the requester is neither owner nor admin.
+   * @throws {AppError} 409 when the certificate is already revoked.
+   */
+  async revokeCertificate(
+    id: string,
+    requester: CertificateRequester,
+    now: Date = new Date()
+  ): Promise<ICertificate> {
+    const lookup = certificateLookupQuery(id.trim());
+    const certificate = await Certificate.findOne(lookup)
+      .select("creatorId revoked")
+      .lean<{ _id: mongoose.Types.ObjectId; creatorId: mongoose.Types.ObjectId }>();
+    if (!certificate) {
+      throw new AppError(
+        "Certificate not found",
+        StatusCodes.NOT_FOUND,
+        "CERTIFICATE_NOT_FOUND"
+      );
+    }
+
+    const isOwner = certificate.creatorId.toString() === requester.id;
+    if (!isOwner && requester.role !== "admin") {
+      throw new AppError(
+        "Only the certificate owner or an admin can revoke this certificate",
+        StatusCodes.FORBIDDEN,
+        "CERTIFICATE_REVOCATION_FORBIDDEN"
+      );
+    }
+
+    // The revoked guard is part of the filter, so two concurrent revocations
+    // cannot both succeed and overwrite each other's revokedBy/revokedAt.
+    const revoked = await Certificate.findOneAndUpdate(
+      { _id: certificate._id, revoked: { $ne: true } },
+      {
+        $set: {
+          revoked: true,
+          revokedAt: now,
+          revokedBy: new mongoose.Types.ObjectId(requester.id),
+        },
+      },
+      { new: true }
+    );
+    if (!revoked) {
+      throw new AppError(
+        "Certificate is already revoked",
+        StatusCodes.CONFLICT,
+        "CERTIFICATE_ALREADY_REVOKED"
+      );
+    }
+
+    return revoked;
+  }
+
+  /**
+   * Aggregates the creator dashboard metrics: total mints, distinct verified
+   * assets and a zero-filled trailing 12-month UTC mint series.
+   *
+   * @throws {AppError} 400 when `creatorId` is missing or not an ObjectId.
+   */
+  async getStats(
+    query: CertificateStatsQuery,
+    now: Date = new Date()
+  ): Promise<CertificateStats> {
+    const { creatorId } = query;
+    if (!creatorId || !mongoose.Types.ObjectId.isValid(creatorId)) {
+      throw new AppError(
+        "creatorId must be a valid MongoDB ObjectId",
+        StatusCodes.BAD_REQUEST,
+        "INVALID_CREATOR_ID"
+      );
+    }
+
+    const owner = { creatorId: new mongoose.Types.ObjectId(creatorId) };
+    const windowStart = startOfUtcMonth(now, -(MONTHLY_SERIES_LENGTH - 1));
+
+    const [totalMinted, assetIds, monthlyRows] = await Promise.all([
+      Certificate.countDocuments(owner),
+      Certificate.distinct("assetId", owner),
+      Certificate.aggregate<{ _id: string; minted: number }>([
+        { $match: { ...owner, mintedAt: { $gte: windowStart, $lte: now } } },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m", date: "$mintedAt" } },
+            minted: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+
+    return {
+      totalMinted,
+      uniqueAssetsVerified: assetIds.length,
+      monthlySeries: buildMonthlySeries(monthlyRows, now),
+    };
   }
 
   /** Loads the cache document plus every relation needed for verification. */

@@ -13,7 +13,7 @@
     "test": "jest",
     "test:integration": "jest --config jest.integration.config.js --runInBand",
     "seed:kms": "ts-node-dev --transpile-only src/utils/seedKMSData.ts",
-    "kms:rewrap": "ts-node-dev --transpile-only src/utils/rewrapKMSKeys.ts",
+    "backfill:spv-links": "ts-node-dev --transpile-only src/utils/backfillSpvCertificateLinks.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

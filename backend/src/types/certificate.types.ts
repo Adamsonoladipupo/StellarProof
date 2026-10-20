@@ -55,6 +55,16 @@ export interface CertificateVerificationChecks {
   timestamp: boolean;
 }
 
+/**
+ * Off-chain revocation state of a cached certificate. Informational only:
+ * it never changes `valid`, because the on-chain record stays authoritative.
+ */
+export interface CertificateRevocationStatus {
+  revoked: boolean;
+  /** ISO-8601 timestamp of the revocation; null when not revoked. */
+  revokedAt: string | null;
+}
+
 /** Full verification payload returned by GET /api/v1/certificates/verify/:id. */
 export interface CertificateVerificationDetails {
   certificateId: string;
@@ -65,6 +75,34 @@ export interface CertificateVerificationDetails {
   checks: CertificateVerificationChecks;
   /** Human-readable list of fields that failed verification. */
   mismatches: string[];
+  revocation: CertificateRevocationStatus;
+}
+
+/** Identity of the caller, used for owner/admin authorization. */
+export interface CertificateRequester {
+  id: string;
+  role: 'creator' | 'developer' | 'admin';
+}
+
+/** Validated query parameters for GET /api/v1/certificates/stats. */
+export interface CertificateStatsQuery {
+  creatorId: string;
+}
+
+/** One calendar month (UTC) of minting activity, formatted as YYYY-MM. */
+export interface CertificateMonthlyMintCount {
+  month: string;
+  minted: number;
+}
+
+/** Creator dashboard metrics returned by GET /api/v1/certificates/stats. */
+export interface CertificateStats {
+  /** Every certificate minted for the creator, including revoked ones. */
+  totalMinted: number;
+  /** Distinct assets that have a certificate for this creator. */
+  uniqueAssetsVerified: number;
+  /** Trailing 12 calendar months (UTC), oldest first, zero-filled. */
+  monthlySeries: CertificateMonthlyMintCount[];
 }
 
 /** Result envelope: `valid` is true only when every field matches. */

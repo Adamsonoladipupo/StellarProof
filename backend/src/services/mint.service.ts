@@ -7,7 +7,9 @@ import Certificate from "../models/Certificate.model";
 import Manifest from "../models/Manifest.model";
 import { VerificationJobModel } from "../models/verificationJob.model";
 import { VerificationStatus } from "../types/verification.types";
+import logger from "../utils/logger";
 import type { MintArgs } from "../utils/xdr";
+import { spvService } from "./spv.service";
 import type {
   ProvenanceContract,
   MintConfirmation,
@@ -143,6 +145,22 @@ export const mongooseMintStore: MintStore = {
         "CERTIFICATE_CACHE_FAILED"
       );
     }
+
+    // Link the asset's vault to the new certificate. Best-effort: the
+    // certificate is already durable, and the SPV backfill covers any miss.
+    await spvService
+      .linkCertificate({
+        assetId: new mongoose.Types.ObjectId(context.assetId),
+        certificateId: certificate._id,
+        verificationJobId: new mongoose.Types.ObjectId(context.jobId),
+      })
+      .catch((error: unknown) => {
+        logger.warn("Failed to link SPV record to certificate", {
+          certificateId: confirmation.certificateId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+
     return persisted;
   },
 
