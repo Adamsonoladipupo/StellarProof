@@ -12,13 +12,13 @@
  * error. Errors are reserved for being unable to reach a verdict, e.g. the
  * gateway is unreachable, and carry a `retryable` flag.
  */
-import crypto from "crypto";
 import { StrKey } from "@stellar/stellar-sdk";
 import { StatusCodes } from "http-status-codes";
 import { z } from "zod";
 import { env } from "../config/env";
 import { AppError } from "../errors/AppError";
 import { assertCid, XdrValidationError } from "../utils/xdr";
+import { CidFetchError, CidFetchService, normalizeSha256, type FetchedCid } from "./cidFetch.service";
 
 export interface SpvVerificationRequest {
   mediaCid: string;
@@ -62,19 +62,22 @@ const manifestSchema = z
   })
   .passthrough();
 
-/** Accepts `<hex>` or `sha256:<hex>`, as written by the manifest pipeline. */
-function normalizeContentHash(value: string): string | null {
-  const hex = value.startsWith("sha256:") ? value.slice("sha256:".length) : value;
-  return /^[0-9a-fA-F]{64}$/.test(hex) ? hex.toLowerCase() : null;
-}
-
 type FetchFn = typeof fetch;
 
 export class SpvVerifierService {
-  constructor(
-    private readonly config: SpvVerifierConfig,
-    private readonly fetchFn: FetchFn = fetch
-  ) {}
+  private readonly cidFetch: CidFetchService;
+
+  constructor(config: SpvVerifierConfig, fetchFn: FetchFn = fetch) {
+    this.cidFetch = new CidFetchService(
+      {
+        gatewayUrl: config.gatewayUrl,
+        timeoutMs: config.fetchTimeoutMs,
+        maxMediaBytes: config.maxMediaBytes,
+        maxManifestBytes: config.maxManifestBytes,
+      },
+      fetchFn
+    );
+  }
 
   async verify(request: SpvVerificationRequest): Promise<SpvVerificationResult> {
     assertCid(request.mediaCid, "mediaCid");
@@ -83,11 +86,11 @@ export class SpvVerifierService {
       throw new XdrValidationError("requester", "expected a valid Stellar G... address");
     }
 
-    const manifestBytes = await this.fetchBytes(request.manifestCid, this.config.maxManifestBytes);
-    const mediaBytes = await this.fetchBytes(request.mediaCid, this.config.maxMediaBytes);
+    const manifest = await this.download(this.cidFetch.fetchManifest(request.manifestCid));
+    const media = await this.download(this.cidFetch.fetchMedia(request.mediaCid));
 
-    const manifestHash = crypto.createHash("sha256").update(manifestBytes).digest("hex");
-    const contentHash = crypto.createHash("sha256").update(mediaBytes).digest("hex");
+    const manifestHash = manifest.sha256;
+    const contentHash = media.sha256;
     const reject = (reason: string): SpvVerificationResult => ({
       verified: false,
       contentHash,
@@ -97,83 +100,38 @@ export class SpvVerifierService {
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(manifestBytes.toString("utf8"));
+      parsed = JSON.parse(manifest.bytes.toString("utf8"));
     } catch {
       return reject("Manifest is not valid JSON");
     }
 
-    const manifest = manifestSchema.safeParse(parsed);
-    if (!manifest.success) {
+    const parsedManifest = manifestSchema.safeParse(parsed);
+    if (!parsedManifest.success) {
       return reject("Manifest is missing a contentHash or creator");
     }
 
-    const declaredHash = normalizeContentHash(manifest.data.contentHash);
+    const declaredHash = normalizeSha256(parsedManifest.data.contentHash);
     if (!declaredHash) {
       return reject("Manifest contentHash is not a SHA-256 hex digest");
     }
     if (declaredHash !== contentHash) {
       return reject("Media SHA-256 does not match the manifest contentHash");
     }
-    if (manifest.data.creator !== request.requester) {
+    if (parsedManifest.data.creator !== request.requester) {
       return reject("Manifest creator does not match the verification requester");
     }
 
     return { verified: true, contentHash, manifestHash };
   }
 
-  private async fetchBytes(cid: string, maxBytes: number): Promise<Buffer> {
-    const url = `${this.config.gatewayUrl.replace(/\/+$/, "")}/${cid}`;
-
-    let response: Response;
+  /** Maps gateway failures onto the SPV error contract the worker retries on. */
+  private async download(pending: Promise<FetchedCid>): Promise<FetchedCid> {
     try {
-      response = await this.fetchFn(url, {
-        signal: AbortSignal.timeout(this.config.fetchTimeoutMs),
-      });
+      return await pending;
     } catch (err) {
-      throw new SpvFetchError(
-        `Gateway request for ${cid} failed: ${err instanceof Error ? err.message : String(err)}`,
-        true
-      );
+      if (err instanceof CidFetchError) throw new SpvFetchError(err.message, err.retryable);
+      throw err;
     }
-
-    if (!response.ok) {
-      // 404 is typical while content propagates; 5xx/429 are transient.
-      const retryable =
-        response.status === 404 || response.status === 429 || response.status >= 500;
-      throw new SpvFetchError(`Gateway returned HTTP ${response.status} for ${cid}`, retryable);
-    }
-
-    const declaredLength = Number(response.headers.get("content-length"));
-    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
-      throw new SpvFetchError(`${cid} exceeds the ${maxBytes}-byte limit`, false);
-    }
-    if (!response.body) {
-      throw new SpvFetchError(`Gateway returned an empty body for ${cid}`, true);
-    }
-
-    const reader = response.body.getReader();
-    const chunks: Buffer[] = [];
-    let total = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel();
-          throw new SpvFetchError(`${cid} exceeds the ${maxBytes}-byte limit`, false);
-        }
-        chunks.push(Buffer.from(value));
-      }
-    } catch (err) {
-      if (err instanceof SpvFetchError) throw err;
-      throw new SpvFetchError(
-        `Reading ${cid} from gateway failed: ${err instanceof Error ? err.message : String(err)}`,
-        true
-      );
-    }
-
-    return Buffer.concat(chunks);
   }
 }
 

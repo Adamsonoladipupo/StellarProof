@@ -175,6 +175,15 @@ export const env = {
   /** Allowed CORS origin for the frontend. */
   CORS_ORIGIN: optionalEnv("CORS_ORIGIN", "http://localhost:3000"),
 
+  /** Public frontend origin used in certificate share links and export QR codes. */
+  PUBLIC_APP_URL: optionalEnv("PUBLIC_APP_URL", "http://localhost:3000"),
+
+  /** Lifetime (seconds) of signed certificate share tokens. Defaults to 7 days. */
+  CERTIFICATE_SHARE_TOKEN_TTL_SECONDS: optionalPositiveIntEnv(
+    "CERTIFICATE_SHARE_TOKEN_TTL_SECONDS",
+    7 * 24 * 60 * 60
+  ),
+
   /** Morgan log format: 'dev' | 'combined' | 'tiny' etc. */
   LOG_LEVEL: optionalEnv("LOG_LEVEL", "dev"),
 
